@@ -77,76 +77,249 @@ MODEL_HIERARCHY = [
     "gemini-2.0-flash-lite"
 ]
 
+MAX_RETRIES_PER_KEY = 3
+TIMEOUT = 45
+BACKOFF_BASE = 1.0  # Base delay in seconds
+MAX_BACKOFF = 30.0  # Maximum delay in seconds
 
-MAX_RETRIES_PER_KEY = 2
-TIMEOUT = 30
-QUOTA_KEYWORDS = ["quota", "exceeded", "rate limit", "403", "too many requests"]
+# Error patterns that indicate specific API issues
+QUOTA_KEYWORDS = ["quota", "exceeded", "rate limit", "429", "too many requests"]
+INTERNAL_ERROR_KEYWORDS = ["500", "internal server error", "internal error"]
+SERVICE_UNAVAILABLE_KEYWORDS = ["503", "service unavailable", "temporarily unavailable"]
+PERMANENT_ERROR_KEYWORDS = ["401", "unauthorized", "invalid api key", "api key not found"]
 
 if not GEMINI_KEYS:
+    logger.error("No Gemini API keys found. Please set them in your environment as gemini_api_1, gemini_api_2, etc.")
     raise RuntimeError("No Gemini API keys found. Please set them in your environment.")
+else:
+    logger.info(f"Loaded {len(GEMINI_KEYS)} Gemini API keys")
+    logger.info(f"Using model hierarchy: {MODEL_HIERARCHY}")
 
 # -------------------- LLM wrapper --------------------
 
 class LLMWithFallback:
-    def __init__(self, keys=None, models=None, temperature=0, backoff=0.5, max_retries=2):
+    def __init__(self, keys=None, models=None, temperature=0, backoff_base=BACKOFF_BASE, max_retries=MAX_RETRIES_PER_KEY):
         self.keys = keys or GEMINI_KEYS
         self.models = models or MODEL_HIERARCHY
         self.temperature = temperature
 
-        # Logs for observability
-        self.failing_keys_log = defaultdict(int)   # how many times a key failed
-        self.slow_keys_log = defaultdict(list)     # (optional) models where key was slow
-        self.permanently_bad_keys = set()          # blacklist of unusable keys
-
+        # Enhanced logging and tracking
+        self.key_failure_count = defaultdict(int)      # Total failures per key
+        self.key_success_count = defaultdict(int)      # Successful calls per key
+        self.key_last_used = defaultdict(float)        # Last usage timestamp per key
+        self.key_cooldown_until = defaultdict(float)   # Cooldown period per key
+        self.permanently_bad_keys = set()              # Blacklisted keys
+        self.model_key_failures = defaultdict(lambda: defaultdict(int))  # Track model+key combo failures
+        
         self.current_llm = None
-        self.backoff = backoff
+        self.backoff_base = backoff_base
         self.max_retries = max_retries
+        self.key_rotation_index = 0  # For round-robin key selection
+        
+        logger.info(f"Initialized LLM with {len(self.keys)} keys and {len(self.models)} models")
+
+    def _categorize_error(self, error_msg: str) -> str:
+        """Categorize error to determine appropriate handling strategy"""
+        error_lower = str(error_msg).lower()
+        
+        if any(keyword in error_lower for keyword in PERMANENT_ERROR_KEYWORDS):
+            return "permanent"
+        elif any(keyword in error_lower for keyword in QUOTA_KEYWORDS):
+            return "quota"  
+        elif any(keyword in error_lower for keyword in INTERNAL_ERROR_KEYWORDS):
+            return "internal"
+        elif any(keyword in error_lower for keyword in SERVICE_UNAVAILABLE_KEYWORDS):
+            return "unavailable"
+        else:
+            return "unknown"
+
+    def _should_skip_key(self, key: str, model: str) -> bool:
+        """Check if a key should be skipped due to cooldown or permanent issues"""
+        current_time = time.time()
+        
+        # Skip permanently bad keys
+        if key in self.permanently_bad_keys:
+            return True
+            
+        # Skip keys in cooldown period
+        if current_time < self.key_cooldown_until[key]:
+            return True
+            
+        # Skip if this model+key combo has failed too many times recently
+        if self.model_key_failures[model][key] >= self.max_retries:
+            return True
+            
+        return False
+
+    def _apply_cooldown(self, key: str, error_category: str):
+        """Apply appropriate cooldown based on error type"""
+        current_time = time.time()
+        
+        if error_category == "quota":
+            # Longer cooldown for quota issues (5-15 minutes)
+            cooldown = min(300 + (self.key_failure_count[key] * 60), 900)
+        elif error_category in ["internal", "unavailable"]:
+            # Medium cooldown for server issues (30 seconds to 5 minutes)
+            cooldown = min(30 + (self.key_failure_count[key] * 30), 300)
+        elif error_category == "permanent":
+            # Permanent ban
+            self.permanently_bad_keys.add(key)
+            return
+        else:
+            # Default cooldown for unknown errors
+            cooldown = min(10 + (self.key_failure_count[key] * 10), 120)
+        
+        self.key_cooldown_until[key] = current_time + cooldown
+        logger.warning(f"Applied {cooldown}s cooldown to key {key[:8]}... due to {error_category} error")
+
+    def _get_next_key(self, available_keys: List[str]) -> str:
+        """Get next key using round-robin with preference for least recently used"""
+        if not available_keys:
+            return None
+            
+        # Sort keys by last usage time (least recently used first)
+        sorted_keys = sorted(available_keys, key=lambda k: self.key_last_used[k])
+        
+        # Use round-robin among top candidates
+        if len(sorted_keys) > 1:
+            self.key_rotation_index = (self.key_rotation_index + 1) % len(sorted_keys)
+            return sorted_keys[self.key_rotation_index % len(sorted_keys)]
+        else:
+            return sorted_keys[0]
 
     def _get_llm_instance(self):
         """
-        Try each model/key combination until one works.
-        - Any exception => log & skip key.
-        - If a key fails consistently => blacklist permanently.
-        - Returns a valid ChatGoogleGenerativeAI instance or raises RuntimeError.
+        Enhanced key/model selection with intelligent fallback and cooldown management
         """
         last_error = None
+        total_attempts = 0
+        max_total_attempts = len(self.keys) * len(self.models) * 2  # Allow some retries
 
         for model in self.models:
-            for key in self.keys:
-                if key in self.permanently_bad_keys:
-                    continue  # skip already blacklisted keys
+            logger.info(f"Trying model: {model}")
+            
+            # Get available keys for this model (not in cooldown)
+            available_keys = [k for k in self.keys if not self._should_skip_key(k, model)]
+            
+            if not available_keys:
+                logger.warning(f"No available keys for model {model}, trying next model")
+                continue
 
-                for attempt in range(1, self.max_retries + 1):
-                    try:
-                        llm_instance = ChatGoogleGenerativeAI(
-                            model=model,
-                            temperature=self.temperature,
-                            google_api_key=key
-                        )
-                        self.current_llm = llm_instance
-                        return llm_instance
+            # Try each available key for this model
+            for attempt in range(min(len(available_keys), 3)):  # Limit attempts per model
+                if total_attempts >= max_total_attempts:
+                    break
+                    
+                key = self._get_next_key(available_keys)
+                if not key:
+                    break
+                    
+                available_keys.remove(key)  # Remove from current attempt pool
+                total_attempts += 1
+                
+                try:
+                    logger.info(f"Attempting with key {key[:8]}... and model {model} (attempt {total_attempts})")
+                    
+                    llm_instance = ChatGoogleGenerativeAI(
+                        model=model,
+                        temperature=self.temperature,
+                        google_api_key=key,
+                        timeout=TIMEOUT
+                    )
+                    
+                    # Test the instance with a simple call
+                    test_response = llm_instance.invoke("Hello")
+                    
+                    # Success! Update tracking
+                    self.key_last_used[key] = time.time()
+                    self.key_success_count[key] += 1
+                    self.model_key_failures[model][key] = 0  # Reset failure count for this combo
+                    self.current_llm = llm_instance
+                    
+                    logger.info(f"Successfully connected with key {key[:8]}... and model {model}")
+                    return llm_instance
 
-                    except Exception as e:
-                        last_error = e
-                        self.failing_keys_log[key] += 1
-                        time.sleep(self.backoff * attempt)  # exponential backoff
+                except Exception as e:
+                    last_error = e
+                    error_msg = str(e)
+                    error_category = self._categorize_error(error_msg)
+                    
+                    # Update failure tracking
+                    self.key_failure_count[key] += 1
+                    self.model_key_failures[model][key] += 1
+                    
+                    logger.error(f"Key {key[:8]}... failed with {model}: {error_category} - {error_msg}")
+                    
+                    # Apply appropriate cooldown
+                    self._apply_cooldown(key, error_category)
+                    
+                    # Calculate backoff delay
+                    delay = min(
+                        self.backoff_base * (2 ** (self.key_failure_count[key] - 1)),
+                        MAX_BACKOFF
+                    )
+                    
+                    if error_category in ["quota", "unavailable"]:
+                        delay *= 2  # Longer delay for these errors
+                    
+                    logger.info(f"Waiting {delay}s before next attempt...")
+                    time.sleep(delay)
 
-                        # If it fails too many times, mark key as permanently bad
-                        if self.failing_keys_log[key] >= self.max_retries:
-                            self.permanently_bad_keys.add(key)
-                            break  # stop retrying this key
+        # Log final statistics before failing
+        logger.error("All keys/models exhausted. Final statistics:")
+        for key in self.keys:
+            logger.error(f"Key {key[:8]}...: {self.key_success_count[key]} successes, {self.key_failure_count[key]} failures")
 
-        raise RuntimeError(f"All models/keys failed. Last error: {last_error}")
+        raise RuntimeError(f"All {len(self.keys)} keys and {len(self.models)} models failed after {total_attempts} attempts. Last error: {last_error}")
+
+    def get_health_status(self) -> dict:
+        """Get current health status of all keys"""
+        current_time = time.time()
+        status = {
+            "total_keys": len(self.keys),
+            "available_keys": 0,
+            "permanently_bad_keys": len(self.permanently_bad_keys),
+            "keys_in_cooldown": 0,
+            "key_details": {}
+        }
+        
+        for key in self.keys:
+            key_id = key[:8] + "..."
+            is_available = not self._should_skip_key(key, self.models[0])  # Check with first model
+            cooldown_remaining = max(0, self.key_cooldown_until[key] - current_time)
+            
+            status["key_details"][key_id] = {
+                "available": is_available,
+                "successes": self.key_success_count[key],
+                "failures": self.key_failure_count[key],
+                "cooldown_remaining_seconds": int(cooldown_remaining),
+                "permanently_bad": key in self.permanently_bad_keys
+            }
+            
+            if is_available:
+                status["available_keys"] += 1
+            elif cooldown_remaining > 0:
+                status["keys_in_cooldown"] += 1
+                
+        return status
 
     # Required by LangChain agent
     def bind_tools(self, tools):
         llm_instance = self._get_llm_instance()
         return llm_instance.bind_tools(tools)
 
-    # Keep .invoke interface
+    # Keep .invoke interface with retry logic
     def invoke(self, prompt):
-        llm_instance = self._get_llm_instance()
-        return llm_instance.invoke(prompt)
+        max_invoke_retries = 2
+        for retry in range(max_invoke_retries):
+            try:
+                llm_instance = self._get_llm_instance()
+                return llm_instance.invoke(prompt)
+            except Exception as e:
+                logger.error(f"Invoke attempt {retry + 1} failed: {str(e)}")
+                if retry == max_invoke_retries - 1:
+                    raise
+                time.sleep(2)  # Brief delay before retry
 
 
 
@@ -531,7 +704,9 @@ def plot_to_base64(max_bytes=100000):
 #     google_api_key=os.getenv("GOOGLE_API_KEY")
 # )
 # -------------------- Initialize LLM --------------------
+logger.info("Initializing LLM with enhanced fallback system...")
 llm = LLMWithFallback(temperature=0)
+logger.info("LLM initialization complete")
 # -----------------------------
 
 # Tools list for agent (LangChain tool decorator returns metadata for the LLM)
@@ -584,60 +759,104 @@ agent_executor = AgentExecutor(
 # -----------------------------
 def run_agent_safely(llm_input: str) -> Dict:
     """
-    1. Run the agent_executor.invoke to get LLM output
+    1. Run the agent_executor.invoke to get LLM output with enhanced error handling
     2. Extract JSON, get 'code' and 'questions'
     3. Detect scrape_url_to_dataframe("...") calls in code, run them here, pickle df and inject before exec
     4. Execute the code in a temp file and return results mapping questions -> answers
     """
-    try:
-        response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
-        raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
-        if not raw_out:
-            return {"error": f"Agent returned no output. Full response: {response}"}
+    max_agent_retries = 2
+    
+    for attempt in range(max_agent_retries):
+        try:
+            logger.info(f"Agent attempt {attempt + 1}/{max_agent_retries}")
+            
+            # Check LLM health before attempting
+            if hasattr(llm, 'get_health_status'):
+                health = llm.get_health_status()
+                logger.info(f"LLM Health: {health['available_keys']}/{health['total_keys']} keys available")
+                
+                if health['available_keys'] == 0:
+                    logger.warning("No API keys available, waiting for cooldowns...")
+                    time.sleep(10)  # Wait a bit for cooldowns
+            
+            response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
+            raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
+            
+            if not raw_out:
+                if attempt < max_agent_retries - 1:
+                    logger.warning(f"Agent returned no output on attempt {attempt + 1}, retrying...")
+                    time.sleep(5)
+                    continue
+                else:
+                    return {"error": f"Agent returned no output after {max_agent_retries} attempts. Full response: {response}"}
 
-        parsed = clean_llm_output(raw_out)
-        if "error" in parsed:
-            return parsed
+            parsed = clean_llm_output(raw_out)
+            if "error" in parsed:
+                if attempt < max_agent_retries - 1:
+                    logger.warning(f"Failed to parse agent output on attempt {attempt + 1}: {parsed['error']}")
+                    time.sleep(3)
+                    continue
+                else:
+                    return parsed
 
-        if not isinstance(parsed, dict) or "code" not in parsed or "questions" not in parsed:
-            return {"error": f"Invalid agent response format: {parsed}"}
+            if not isinstance(parsed, dict) or "code" not in parsed or "questions" not in parsed:
+                if attempt < max_agent_retries - 1:
+                    logger.warning(f"Invalid agent response format on attempt {attempt + 1}")
+                    time.sleep(3)
+                    continue
+                else:
+                    return {"error": f"Invalid agent response format: {parsed}"}
 
-        code = parsed["code"]
-        questions: List[str] = parsed["questions"]
+            code = parsed["code"]
+            questions: List[str] = parsed["questions"]
 
-        # Detect scrape calls; find all URLs used in scrape_url_to_dataframe("URL")
-        urls = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code)
-        pickle_path = None
-        if urls:
-            # For now support only the first URL (agent may code multiple scrapes; you can extend this)
-            url = urls[0]
-            tool_resp = scrape_url_to_dataframe(url)
-            if tool_resp.get("status") != "success":
-                return {"error": f"Scrape tool failed: {tool_resp.get('message')}"}
-            # create df and pickle it
-            df = pd.DataFrame(tool_resp["data"])
-            temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
-            temp_pkl.close()
-            df.to_pickle(temp_pkl.name)
-            pickle_path = temp_pkl.name
-            # Make sure agent's code can reference df/data: we will inject the pickle loader in the temp script
+            # Detect scrape calls; find all URLs used in scrape_url_to_dataframe("URL")
+            urls = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code)
+            pickle_path = None
+            if urls:
+                # For now support only the first URL (agent may code multiple scrapes; you can extend this)
+                url = urls[0]
+                tool_resp = scrape_url_to_dataframe(url)
+                if tool_resp.get("status") != "success":
+                    return {"error": f"Scrape tool failed: {tool_resp.get('message')}"}
+                # create df and pickle it
+                df = pd.DataFrame(tool_resp["data"])
+                temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+                temp_pkl.close()
+                df.to_pickle(temp_pkl.name)
+                pickle_path = temp_pkl.name
+                # Make sure agent's code can reference df/data: we will inject the pickle loader in the temp script
 
-        # Execute code in temp python script
-        exec_result = write_and_run_temp_python(code, injected_pickle=pickle_path, timeout=LLM_TIMEOUT_SECONDS)
-        if exec_result.get("status") != "success":
-            return {"error": f"Execution failed: {exec_result.get('message', exec_result)}", "raw": exec_result.get("raw")}
+            # Execute code in temp python script
+            exec_result = write_and_run_temp_python(code, injected_pickle=pickle_path, timeout=LLM_TIMEOUT_SECONDS)
+            if exec_result.get("status") != "success":
+                return {"error": f"Execution failed: {exec_result.get('message', exec_result)}", "raw": exec_result.get("raw")}
 
-        # exec_result['result'] should be results dict
-        results_dict = exec_result.get("result", {})
-        # Map to original questions (they asked to use exact question strings)
-        output = {}
-        for q in questions:
-            output[q] = results_dict.get(q, "Answer not found")
-        return output
+            # exec_result['result'] should be results dict
+            results_dict = exec_result.get("result", {})
+            # Map to original questions (they asked to use exact question strings)
+            output = {}
+            for q in questions:
+                output[q] = results_dict.get(q, "Answer not found")
+            return output
 
-    except Exception as e:
-        logger.exception("run_agent_safely failed")
-        return {"error": str(e)}
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Attempt {attempt + 1} failed: {error_msg}")
+            
+            # Check if it's an API-related error that we should retry
+            if any(keyword in error_msg.lower() for keyword in ["429", "500", "503", "quota", "rate limit"]):
+                if attempt < max_agent_retries - 1:
+                    wait_time = (2 ** attempt) * 5  # Exponential backoff: 5s, 10s
+                    logger.info(f"API error detected, waiting {wait_time}s before retry...")
+                    time.sleep(wait_time)
+                    continue
+            
+            if attempt == max_agent_retries - 1:
+                logger.exception("run_agent_safely failed after all retries")
+                return {"error": error_msg}
+
+    return {"error": "All retry attempts exhausted"}
 
 
 from fastapi import Request
@@ -852,11 +1071,23 @@ async def favicon():
 @app.get("/api", include_in_schema=False)
 async def analyze_get_info():
     """Health/info endpoint. Use POST /api for actual analysis."""
+    health_info = {}
+    if hasattr(llm, 'get_health_status'):
+        health_info = llm.get_health_status()
+    
     return JSONResponse({
         "ok": True,
         "message": "Server is running. Use POST /api with 'questions_file' and optional 'data_file'.",
-
+        "llm_health": health_info
     })
+
+@app.get("/api/health")
+async def api_health():
+    """Detailed API health status endpoint"""
+    if hasattr(llm, 'get_health_status'):
+        return JSONResponse(llm.get_health_status())
+    else:
+        return JSONResponse({"error": "Health status not available"})
 
 
 
